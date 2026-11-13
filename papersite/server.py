@@ -7,6 +7,10 @@ the demo corpus:
 * /papers/slow.html    -- served only after a delay, so its (short) path to
                           paper X arrives *after* the long chain registered X
                           at a deeper depth ("late short path").
+* /papers/X.html       -- also delayed, so X's own response is still in flight
+                          when the short path lowers X's depth.  The crawler
+                          must record X's citations from the lowered depth
+                          (Y at 3), not from the depth X was claimed at.
 * /papers/broken.html  -- the FIRST request fails with HTTP 500; later
                           requests succeed ("one request failure", retryable).
 * everything else      -- ordinary static files (text/html for .html).
@@ -23,7 +27,7 @@ import time
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "site")
 PORT = int(os.environ.get("PORT", "8080"))
 
-DELAY_SECONDS = {"/papers/slow.html": 2.5}
+DELAY_SECONDS = {"/papers/slow.html": 2.5, "/papers/X.html": 4.0}
 FLAKY_PATHS = {"/papers/broken.html"}
 
 _lock = threading.Lock()

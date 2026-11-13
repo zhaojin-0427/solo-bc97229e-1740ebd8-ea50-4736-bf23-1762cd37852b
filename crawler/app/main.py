@@ -44,15 +44,129 @@ app = FastAPI(
         "and a max depth (0-4, seed = depth 0); the crawler fetches same-origin, "
         "redirect-free static HTML pages with two slots per job, persists pages, "
         "citations and pending progress in SQLite, resumes after restarts and "
-        "never reports completion while failures remain."
+        "never reports completion while failures remain.\n\n"
+        "Depths are always the shortest known distance from the seed, including "
+        "for responses that were in flight when a late shorter path lowered the "
+        "page: such pages are recorded from their current depth and whatever "
+        "newly falls inside max_depth is backfilled without refetching."
     ),
+    openapi_tags=[
+        {"name": "jobs", "description": "Create, inspect and retry crawl jobs."},
+        {"name": "corpus", "description": "Query collected papers and citation edges."},
+    ],
     lifespan=lifespan,
 )
 
 
 class JobCreate(BaseModel):
-    seed_url: str = Field(..., examples=["http://papersite:8080/papers/p0.html"])
-    max_depth: int = Field(..., ge=0, le=4, examples=[4])
+    seed_url: str = Field(
+        ...,
+        description="Absolute http(s) URL of the seed paper (depth 0).",
+        examples=["http://papersite:8080/papers/p0.html"],
+    )
+    max_depth: int = Field(
+        ...,
+        ge=0,
+        le=4,
+        description="Maximum citation depth to collect (seed = 0).",
+        examples=[4],
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"seed_url": "http://papersite:8080/papers/p0.html", "max_depth": 4}
+            ]
+        }
+    }
+
+
+class JobOut(BaseModel):
+    id: int
+    seed_url: str
+    origin: str
+    max_depth: int
+    status: str = Field(description="running | completed | failed")
+    created_at: str
+    finished_at: str | None
+    counts: dict[str, int] = Field(
+        description="Papers by status, e.g. done / failed / external / non_html."
+    )
+    papers_by_depth: dict[str, int] = Field(
+        description="Registered papers per depth; depths are shortest distances."
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "id": 1,
+                    "seed_url": "http://papersite:8080/papers/p0.html",
+                    "origin": "http://papersite:8080",
+                    "max_depth": 4,
+                    "status": "failed",
+                    "created_at": "2026-01-01T00:00:00.000+00:00",
+                    "finished_at": "2026-01-01T00:00:03.000+00:00",
+                    "counts": {
+                        "done": 13,
+                        "failed": 1,
+                        "external": 1,
+                        "non_html": 1,
+                    },
+                    "papers_by_depth": {"0": 1, "1": 3, "2": 6, "3": 3, "4": 3},
+                }
+            ]
+        }
+    }
+
+
+class PaperOut(BaseModel):
+    id: int
+    job_id: int
+    url: str
+    depth: int = Field(description="Shortest known distance from the seed.")
+    status: str = Field(
+        description="pending | fetching | done | failed | out_of_range | external | non_html"
+    )
+    title: str | None = None
+    http_status: int | None = None
+    error: str | None = None
+    fetched_at: str | None = None
+
+
+class CitationOut(BaseModel):
+    src_url: str
+    dst_url: str
+
+
+class PapersResponse(BaseModel):
+    job_id: int
+    papers: list[PaperOut]
+
+
+class CitationsResponse(BaseModel):
+    job_id: int
+    citations: list[CitationOut]
+
+
+class FailureOut(BaseModel):
+    url: str
+    depth: int
+    http_status: int | None
+    error: str | None
+    fetched_at: str | None
+
+
+class FailuresResponse(BaseModel):
+    job_id: int
+    failures: list[FailureOut]
+
+
+class RetryResponse(BaseModel):
+    job_id: int
+    requeued: int = Field(description="Number of failed pages put back in the queue.")
+    previous_status: str
+    job: JobOut
 
 
 @app.get("/", include_in_schema=False)
@@ -60,7 +174,13 @@ def root():
     return RedirectResponse("/docs")
 
 
-@app.post("/jobs", status_code=201, summary="Create a crawl job")
+@app.post(
+    "/jobs",
+    status_code=201,
+    summary="Create a crawl job",
+    response_model=JobOut,
+    tags=["jobs"],
+)
 async def create_job(body: JobCreate):
     seed_url = urldefrag(body.seed_url.strip())[0]
     parsed = urlparse(seed_url)
@@ -72,17 +192,27 @@ async def create_job(body: JobCreate):
     return _job_payload(job_id)
 
 
-@app.get("/jobs", summary="List all jobs")
+@app.get("/jobs", summary="List all jobs", response_model=list[JobOut], tags=["jobs"])
 async def list_jobs():
     return [_job_payload(j["id"]) for j in db.list_jobs()]
 
 
-@app.get("/jobs/{job_id}", summary="Job status and progress")
+@app.get(
+    "/jobs/{job_id}",
+    summary="Job status and progress",
+    response_model=JobOut,
+    tags=["jobs"],
+)
 async def job_detail(job_id: int):
     return _job_payload(job_id)
 
 
-@app.post("/jobs/{job_id}/retry", summary="Re-queue failed pages and resume the job")
+@app.post(
+    "/jobs/{job_id}/retry",
+    summary="Re-queue failed pages and resume the job",
+    response_model=RetryResponse,
+    tags=["jobs"],
+)
 async def retry_job(job_id: int):
     job = db.get_job(job_id)
     if job is None:
@@ -95,21 +225,36 @@ async def retry_job(job_id: int):
     return {"job_id": job_id, **result, "job": _job_payload(job_id)}
 
 
-@app.get("/jobs/{job_id}/failures", summary="Failed URLs of a job")
+@app.get(
+    "/jobs/{job_id}/failures",
+    summary="Failed URLs of a job",
+    response_model=FailuresResponse,
+    tags=["jobs"],
+)
 async def job_failures(job_id: int):
     if db.get_job(job_id) is None:
         raise HTTPException(404, "job not found")
     return {"job_id": job_id, "failures": db.list_failures(job_id)}
 
 
-@app.get("/jobs/{job_id}/papers", summary="Papers registered by a job")
+@app.get(
+    "/jobs/{job_id}/papers",
+    summary="Papers registered by a job",
+    response_model=PapersResponse,
+    tags=["corpus"],
+)
 async def job_papers(job_id: int, status: str | None = None, depth: int | None = None):
     if db.get_job(job_id) is None:
         raise HTTPException(404, "job not found")
     return {"job_id": job_id, "papers": db.list_papers(job_id, status=status, depth=depth)}
 
 
-@app.get("/jobs/{job_id}/citations", summary="Citation edges collected by a job")
+@app.get(
+    "/jobs/{job_id}/citations",
+    summary="Citation edges collected by a job",
+    response_model=CitationsResponse,
+    tags=["corpus"],
+)
 async def job_citations(job_id: int, src: str | None = None):
     if db.get_job(job_id) is None:
         raise HTTPException(404, "job not found")

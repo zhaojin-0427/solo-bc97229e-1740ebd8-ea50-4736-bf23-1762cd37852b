@@ -161,18 +161,33 @@ class Database:
 
     # ------------------------------------------------------- record outcomes
 
-    def record_success(self, job_id, paper_id, page_url, page_depth, title, links, http_status):
+    def record_success(self, job_id, paper_id, page_url, title, links, http_status):
         """Persist page + citations + queue progress in ONE transaction.
 
-        Depths always hold the shortest known distance from the seed.  When a
-        late, shorter path reaches an already registered URL we lower its depth
-        and propagate the decrease through already-fetched pages, so papers that
-        newly fall inside max_depth are queued (backfilled) without refetching
+        Depths always hold the shortest known distance from the seed.  The
+        depth used to expand this page is read back *inside* the transaction:
+        while the request was in flight a late, shorter path may have lowered
+        the page (e.g. long chain registers X at 4, a slow page then reveals
+        X at 2).  Expanding from the claimed depth would re-register X's
+        children too deep; expanding from the current depth keeps them correct
+        and backfills whatever newly falls inside max_depth.
+
+        When a late shorter path reaches an already registered URL we lower its
+        depth and propagate the decrease through already-fetched pages, so
+        papers that newly fall inside max_depth are queued without refetching
         anything.
         """
         with self._tx() as conn:
             job = conn.execute("SELECT max_depth, origin FROM jobs WHERE id=?", (job_id,)).fetchone()
             max_depth, origin = job["max_depth"], job["origin"]
+
+            row = conn.execute(
+                "SELECT url, depth FROM papers WHERE id=? AND job_id=?", (paper_id, job_id)
+            ).fetchone()
+            if row is None:
+                return
+            page_url = row["url"]
+            page_depth = row["depth"]  # latest shortest distance, not the stale claim
 
             conn.execute(
                 "UPDATE papers SET status=?, title=?, http_status=?, error=NULL, fetched_at=?"
@@ -180,7 +195,11 @@ class Database:
                 (DONE, title, http_status, utcnow(), paper_id),
             )
 
-            stack = []  # (url, new_depth) of done pages whose children need re-checking
+            # Children are expanded from page_depth (the fresh shortest
+            # distance), so an in-flight depth decrease is honoured here; the
+            # stack collects done pages whose children need re-checking when
+            # one of those children turns out to be already registered.
+            stack = []
             for dst in links:
                 conn.execute(
                     "INSERT OR IGNORE INTO citations(job_id, src_url, dst_url) VALUES (?,?,?)",

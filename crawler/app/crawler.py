@@ -72,7 +72,7 @@ class CrawlManager:
                     log.exception("could not record failure for %s", paper["url"])
 
     async def _fetch_and_record(self, job_id: int, paper: dict):
-        url, pid, depth = paper["url"], paper["id"], paper["depth"]
+        url, pid = paper["url"], paper["id"]
         try:
             resp = await self._client.get(url)
         except httpx.HTTPError as exc:
@@ -102,4 +102,4 @@ class CrawlManager:
             if absolute not in seen:
                 seen.add(absolute)
                 links.append(absolute)
-        self.db.record_success(job_id, pid, url, depth, title, links, status)
+        self.db.record_success(job_id, pid, url, title, links, status)
